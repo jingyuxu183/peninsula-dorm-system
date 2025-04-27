@@ -1,0 +1,9 @@
+@echo off
+echo 启动宿舍费用计算与分析工具...
+
+echo 检查并安装必要依赖...
+pip install -r requirements.txt
+
+echo 启动应用程序...
+streamlit run app.py
+pause 

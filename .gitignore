@@ -1,0 +1,45 @@
+# Python相关
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+ENV/
+.env
+
+# IDE相关
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Excel相关
+*.xlsx
+*.xls
+*.csv
+
+# Streamlit相关
+.streamlit/secrets.toml
+
+# 其他
+.DS_Store
+.vscode/
+.ipynb_checkpoints 
