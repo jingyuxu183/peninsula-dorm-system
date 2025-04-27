@@ -299,12 +299,21 @@ class DeepSeekAPI:
         try:
             # 构建消息
             messages = [
-                {"role": "system", "content": "你是一个专业的数据处理和分析助手。"},
+                {"role": "system", "content": "你是一个专业的数据处理和分析助手。请确保返回格式正确的JSON数据，必须包含data字段。"},
                 {"role": "user", "content": prompt}
             ]
             
             # 固定使用deepseek-chat模型
             use_model = "deepseek-chat"
+            
+            # 如果提示中包含JSON相关关键词，添加格式指导
+            if "JSON" in prompt or "json" in prompt or "表格" in prompt or "table" in prompt:
+                messages[0]["content"] += """
+                如果要求返回JSON格式数据，请确保：
+                1. 返回格式严格有效的JSON，不要有任何额外文本
+                2. 必须包含以下字段：table_name, headers, data
+                3. data字段必须是二维数组，即使为空也必须提供[]
+                """
             
             # 调用API（非流式）
             response = self.client.chat.completions.create(
@@ -1153,7 +1162,7 @@ class DormDataProcessor:
                         if not df_info["dataframe"].empty:
                             df = df_info["dataframe"]
                             logger.info(f"主数据框为空，使用文件 '{df_info['filename']}' 作为数据源")
-                            break
+                        break
                 
                 # 如果还是没有可用数据，返回错误
                 if df is None or df.empty:
@@ -1162,14 +1171,79 @@ class DormDataProcessor:
             # 限制样本数据量，避免提示词过长
             sample_rows = min(30, len(df))
             
-            # 将DataFrame转换为字符串表示，更易于模型理解
-            # df_string = df.head(sample_rows).to_string(index=False)
+            # 创建数据样本
+            data_stats = {}
+            sample_rows = min(30, len(df))  # 最多30行作为样本
             
-            # 收集数据样本和统计信息
+            # 提取重要列的名称变体
+            important_columns = ["序号", "姓名", "入住天数", "个人水电费", "个人租金", "合计"]
+            alt_columns = {
+                "序号": ["序号", "序", "宿舍号", "房号", "ID", "id"],
+                "姓名": ["姓名", "姓", "名字", "名", "人员", "学生"],
+                "入住天数": ["入住天数", "天数", "入住", "住宿天数", "住宿"],
+                "个人水电费": ["个人水电费", "水电费", "水电", "费用"],
+                "个人租金": ["个人租金", "租金", "房租"],
+                "合计": ["合计", "总计", "总费用", "总额", "总金额"]
+            }
+            
+            # 收集数据样本之前，先检测重要列
+            df_columns = list(df.columns)
+            # 映射找到的重要列
+            important_col_mapping = {}
+            
+            # 找出列的映射关系
+            for key_col in important_columns:
+                # 直接匹配
+                if key_col in df_columns:
+                    important_col_mapping[key_col] = key_col
+                    continue
+                
+                # 尝试使用备选名称匹配
+                for alt_name in alt_columns[key_col]:
+                    if alt_name in df_columns:
+                        important_col_mapping[key_col] = alt_name
+                        break
+                
+                # 尝试部分匹配
+                if key_col not in important_col_mapping:
+                    for col in df_columns:
+                        for alt_name in alt_columns[key_col]:
+                            if alt_name.lower() in col.lower() or col.lower() in alt_name.lower():
+                                important_col_mapping[key_col] = col
+                                break
+                        if key_col in important_col_mapping:
+                            break
+                    
+            # 将找到的重要列信息添加到统计信息中
+            data_stats["important_columns_mapping"] = important_col_mapping
+            
+            # 收集数据样本
             data_sample = []
+            
             for _, row in df.head(sample_rows).iterrows():
                 row_dict = {}
+                # 先添加重要列
+                for key_col, mapped_col in important_col_mapping.items():
+                    if mapped_col in row:
+                        val = row[mapped_col]
+                        # 确保所有值都可以JSON序列化
+                        if pd.isna(val):
+                            row_dict[key_col] = None
+                        elif isinstance(val, (pd.Timestamp, np.datetime64)):
+                            row_dict[key_col] = val.isoformat() if hasattr(val, 'isoformat') else str(val)
+                        elif isinstance(val, (np.int64, np.float64)):
+                            row_dict[key_col] = int(val) if isinstance(val, np.int64) else float(val)
+                        else:
+                            row_dict[key_col] = str(val)
+                else:
+                            row_dict[key_col] = str(val)
+                
+                # 再添加其他列
                 for col, val in row.items():
+                    # 跳过已经添加的重要列
+                    if col in important_col_mapping.values():
+                        continue
+                        
                     # 确保所有值都可以JSON序列化
                     if pd.isna(val):
                         row_dict[col] = None
@@ -1179,16 +1253,15 @@ class DormDataProcessor:
                         row_dict[col] = int(val) if isinstance(val, np.int64) else float(val)
                     else:
                         row_dict[col] = str(val)
+                
                 data_sample.append(row_dict)
             
             # 创建主数据统计信息
-            data_stats = {
-                "main_table": {
-                    "columns": list(df.columns),
-                    "row_count": len(df),
-                    "numeric_columns": [str(col) for col in df.select_dtypes(include=np.number).columns],
-                    "sample_data": data_sample
-                }
+            data_stats["main_table"] = {
+                "columns": list(df.columns),
+                "row_count": len(df),
+                "numeric_columns": [str(col) for col in df.select_dtypes(include=np.number).columns],
+                "sample_data": data_sample
             }
             
             # 如果有其他数据框，添加它们的信息
@@ -1260,18 +1333,31 @@ class DormDataProcessor:
                 请分析用户的需求，确定应该基于哪个数据表生成结果。
                 如果用户未明确指定，应该默认使用主数据表。
                 
+                在生成表格时，请确保包含以下重要字段（如果数据中存在）：
+                1. 序号/房号/宿舍号 - 用于标识房间
+                2. 姓名 - 用于标识人员
+                3. 入住天数 - 表示住宿时长
+                4. 个人水电费 - 人员需支付的水电费用
+                5. 个人租金 - 人员需支付的租金
+                6. 合计 - 总费用
+                
                 请返回一个JSON对象，包含以下字段：
                 {
                   "table_name": "表格名称",
-                  "headers": ["列1", "列2", "列3"],
+                  "headers": ["序号", "姓名", "入住天数", "个人水电费", "个人租金", "合计"],
                   "data": [
-                    ["行1列1值", "行1列2值", "行1列3值"],
-                    ["行2列1值", "行2列2值", "行2列3值"]
+                    ["85", "陈瑞林", "31", "64.89", "0", "64.89"],
+                    ["86", "丁国辉", "31", "64.89", "0", "64.89"]
                   ],
                   "summary": "这个表格的简要描述，说明表格包含的内容和目的"
                 }
                 
-                仅返回JSON对象，不要添加其他文本。确保返回的是有效的JSON格式。
+                【注意】：
+                1. 仅返回JSON对象，不要添加其他文本。确保返回的是有效的JSON格式。
+                2. data字段必须是二维数组，即使为空也必须提供[]而不是null或省略此字段。
+                3. 即使没有数据，也必须包含headers和空的data数组。
+                4. 不要使用Markdown代码块或任何其他格式标记，直接返回纯JSON对象。
+                5. 确保返回的数据与数据源中的值完全匹配，尤其是姓名和数值不要随意修改。
                 """
                 
                 # 准备用户消息
@@ -1281,9 +1367,20 @@ class DormDataProcessor:
 
 数据统计信息：{json.dumps(data_stats, ensure_ascii=False, indent=2)}
 
-请生成一个JSON对象，包含表格名称、表头、数据行和表格摘要。
-请确保返回的是有效的JSON格式。
-请分析我的请求，确定应该使用哪个数据源，并生成适当的表格。
+请生成一个JSON对象，必须包含以下所有字段：
+1. table_name - 表格名称
+2. headers - 表头数组，请确保包含序号、姓名、入住天数、个人水电费、个人租金和合计等重要字段
+3. data - 二维数据数组，每个内部数组是一行数据
+4. summary - 表格摘要描述
+
+重点确保表格中包含姓名字段，这是标识每个人的重要信息。
+
+【重要提示】：
+- 返回格式必须是有效的JSON
+- 不要省略任何字段，特别是data字段
+- 不要添加Markdown代码块标记或其他说明文字
+- 直接输出纯JSON对象
+- 确保数据与原始数据匹配，不要修改原始数据中的名称、数字等内容
 """
                 
                 messages = [
@@ -1302,7 +1399,39 @@ class DormDataProcessor:
                     
                     if json_start >= 0 and json_end > json_start:
                         json_text = response[json_start:json_end+1]
-                        table_data = json.loads(json_text)
+                        
+                        # 预处理JSON文本，清理可能的格式问题
+                        try:
+                            table_data = json.loads(json_text)
+                        except json.JSONDecodeError as je:
+                            # 如果解析失败，尝试进一步清理
+                            logger.warning(f"首次JSON解析失败: {str(je)}，尝试清理后重新解析")
+                            
+                            # 处理可能的转义问题
+                            json_text = json_text.replace('\\"', '"').replace("\\'", "'")
+                            
+                            # 尝试修复常见的格式错误
+                            json_text = json_text.replace("'", '"')  # 将单引号替换为双引号
+                            
+                            # 移除可能的换行符和制表符
+                            json_text = json_text.replace('\n', ' ').replace('\t', ' ')
+                            
+                            # 尝试使用正则表达式找到有效的JSON对象
+                            import re
+                            json_pattern = r'\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}'
+                            matches = re.findall(json_pattern, json_text)
+                            if matches:
+                                for potential_json in matches:
+                                    try:
+                                        table_data = json.loads(potential_json)
+                                        logger.info("使用正则表达式提取的JSON成功解析")
+                                        break
+                                    except:
+                                        continue
+                            else:
+                                # 如果正则表达式没有找到匹配项，尝试简单的压缩处理
+                                json_text = re.sub(r'\s+', ' ', json_text).strip()
+                                table_data = json.loads(json_text)
                         
                         # 验证必要的字段
                         required_fields = ["table_name", "headers", "data"]
@@ -1310,11 +1439,115 @@ class DormDataProcessor:
                             # 如果没有提供summary，添加一个默认的
                             if "summary" not in table_data:
                                 table_data["summary"] = f"表格包含 {len(table_data['data'])} 行数据"
+                            
+                            # 验证数据格式是否正确
+                            headers = table_data["headers"]
+                            data = table_data["data"]
+                            
+                            # 检查是否包含姓名列（直接在headers中或等价名称）
+                            name_column_alternatives = ["姓名", "名字", "姓", "名", "人员"]
+                            has_name_column = any(col in name_column_alternatives or any(alt in col.lower() for alt in name_column_alternatives) for col in headers)
+                            
+                            if not has_name_column:
+                                logger.warning("表格中缺少姓名列，这可能会导致识别问题")
+                                # 尝试从源数据中找到姓名列并添加
+                                name_col = None
+                                for col in df.columns:
+                                    if col in name_column_alternatives or any(alt in col.lower() for alt in name_column_alternatives):
+                                        name_col = col
+                                        break
                                 
+                                if name_col:
+                                    # 添加姓名列到表头
+                                    headers.insert(1, "姓名")  # 通常姓名放在序号后面
+                                    # 获取数据样本用于添加姓名
+                                    name_values = {}
+                                    id_col = None
+                                    # 尝试找到ID列作为关联键
+                                    id_alternatives = ["序号", "宿舍号", "房号", "ID", "id"]
+                                    for col in df.columns:
+                                        if col in id_alternatives or any(alt in col.lower() for alt in id_alternatives):
+                                            id_col = col
+                                            break
+                                    
+                                    if id_col:
+                                        # 创建ID到姓名的映射
+                                        for idx, row in df.iterrows():
+                                            if pd.notna(row[id_col]) and pd.notna(row[name_col]):
+                                                name_values[str(row[id_col])] = str(row[name_col])
+                                        
+                                        # 更新所有数据行添加姓名
+                                        for row in data:
+                                            if len(row) >= 1 and str(row[0]) in name_values:
+                                                row.insert(1, name_values[str(row[0])])
+                                            else:
+                                                row.insert(1, "")  # 如果找不到匹配的姓名，插入空值
+                                
+                                        logger.info(f"已添加姓名列到表格")
+                                    else:
+                                        # 无法找到ID列，直接添加空值
+                                        for row in data:
+                                            row.insert(1, "")
+                                        logger.warning("无法找到ID列关联姓名，已添加空姓名列")
+                            
+                            # 确保数据是二维数组
+                            if not isinstance(data, list):
+                                data = []
+                                table_data["data"] = data
+                                logger.warning("API返回的data字段不是列表，已替换为空列表")
+                            elif data and not all(isinstance(row, list) for row in data):
+                                # 修复非二维数组
+                                fixed_data = []
+                                for item in data:
+                                    if isinstance(item, list):
+                                        fixed_data.append(item)
+                                    else:
+                                        fixed_data.append([item])  # 将非列表项包装为列表
+                                table_data["data"] = fixed_data
+                                logger.warning("修复了非二维数组数据")
+                            
+                            # 处理每行长度与表头不匹配的情况
+                            if data:
+                                for i, row in enumerate(data):
+                                    if len(row) < len(headers):
+                                        # 填充缺少的列
+                                        data[i] = row + [None] * (len(headers) - len(row))
+                                        logger.warning(f"第{i+1}行数据列数不足，已填充空值")
+                                    elif len(row) > len(headers):
+                                        # 裁剪多余的列
+                                        data[i] = row[:len(headers)]
+                                        logger.warning(f"第{i+1}行数据列数过多，已裁剪")
+                            
                             return table_data, "成功使用API生成表格"
                         else:
                             missing = [f for f in required_fields if f not in table_data]
-                            return {"error": f"API返回的JSON缺少必要字段: {missing}"}, "API返回的JSON缺少必要字段"
+                            logger.error(f"API返回的JSON缺少必要字段: {missing}")
+                            
+                            # 添加缺失字段的修复尝试
+                            if "data" not in table_data and "headers" in table_data:
+                                # 如果缺少data字段但有headers，创建一个空的data数组
+                                table_data["data"] = []
+                                logger.info("已添加空的data字段")
+                            
+                            if "headers" not in table_data:
+                                # 如果缺少headers字段，添加一个基本的headers
+                                table_data["headers"] = ["列1"]
+                                logger.info("已添加基本headers字段")
+                                
+                            if "table_name" not in table_data:
+                                # 如果缺少table_name字段，添加一个基本的table_name
+                                table_data["table_name"] = "数据表格"
+                                logger.info("已添加基本table_name字段")
+                            
+                            # 重新检查必要字段
+                            if all(field in table_data for field in required_fields):
+                                if "summary" not in table_data:
+                                    table_data["summary"] = f"表格包含 {len(table_data['data'])} 行数据"
+                                return table_data, "成功修复并使用API生成的表格"
+                            else:
+                                # 如果还是缺少必要字段，使用fallback方法
+                                logger.error("无法修复API返回的JSON，尝试备用方法")
+                                return self.generate_table_fallback(df, user_request, all_dataframes)
                     else:
                         # 没有找到有效的JSON，尝试备用方法
                         logger.error("API响应中没有找到有效的JSON")
@@ -1366,32 +1599,92 @@ class DormDataProcessor:
                     "summary": "无法生成表格，因为没有可用数据"
                 }, "无可用数据"
             
-            # 准备一个简单的表格，使用前10行数据
-            headers = list(target_df.columns)[:10]  # 最多取10列
+            # 准备要包含的重要列
+            # 根据上传图片中的内容，我们需要包含：序号、姓名、入住天数、个人水电费、个人租金和合计字段
+            important_columns = ["序号", "姓名", "入住天数", "个人水电费", "个人租金", "合计"]
+            alt_columns = {
+                "序号": ["序号", "序", "宿舍号", "房号", "ID", "id", "房间号"],
+                "姓名": ["姓名", "姓", "名字", "名", "人员", "学生", "姓名"],
+                "入住天数": ["入住天数", "天数", "入住", "住宿天数", "住宿", "入住时间"],
+                "个人水电费": ["个人水电费", "水电费", "水电", "费用", "电费", "水费"],
+                "个人租金": ["个人租金", "租金", "房租", "人员租金"],
+                "合计": ["合计", "总计", "总费用", "总额", "总金额", "合计金额"]
+            }
+            
+            # 尝试找到重要列的对应列
+            headers = []
+            headers_mapping = {}
+            
+            # 找出所有列的名称并准备映射
+            all_cols = list(target_df.columns)
+            for key_col in important_columns:
+                # 直接匹配
+                if key_col in all_cols:
+                    headers.append(key_col)
+                    headers_mapping[key_col] = key_col
+                    continue
+                
+                # 尝试使用备选名称匹配
+                found = False
+                for alt_name in alt_columns[key_col]:
+                    if alt_name in all_cols:
+                        headers.append(alt_name)
+                        headers_mapping[key_col] = alt_name
+                        found = True
+                        break
+                
+                # 如果仍然没有找到，尝试部分匹配
+                if not found:
+                    for col in all_cols:
+                        for alt_name in alt_columns[key_col]:
+                            if alt_name.lower() in col.lower() or col.lower() in alt_name.lower():
+                                headers.append(col)
+                                headers_mapping[key_col] = col
+                                found = True
+                                break
+                        if found:
+                            break
+            
+            # 如果仍然没有找到某些重要列，添加尚未添加的前5-10列
+            remaining_cols = [col for col in all_cols if col not in headers]
+            for col in remaining_cols:
+                if len(headers) < 10:  # 最多显示10列
+                    headers.append(col)
             
             # 如果列数太多，添加一个说明
             headers_note = ""
-            if len(target_df.columns) > 10:
-                headers_note = f"(仅显示前10列，总共{len(target_df.columns)}列)"
+            if len(target_df.columns) > len(headers):
+                headers_note = f"(显示{len(headers)}列，总共{len(target_df.columns)}列)"
+            
+            # 确保数据中有姓名列
+            if "姓名" not in headers and target_df.shape[1] > 0:
+                # 尝试添加第二列作为姓名列，如果它不是已知的数值列
+                if len(target_df.columns) > 1:
+                    second_col = target_df.columns[1]
+                    if second_col not in headers and not pd.api.types.is_numeric_dtype(target_df[second_col]):
+                        headers.insert(1, second_col)  # 通常姓名放在序号后面
+                        headers_mapping["姓名"] = second_col
             
             # 准备数据行
             data = []
-            for _, row in target_df.head(20).iterrows():  # 最多取20行
+            for _, row in target_df.head(50).iterrows():  # 最多取50行
                 data_row = []
                 for col in headers:
                     # 确保值是字符串
                     val = row.get(col, "")
                     if pd.isna(val):
                         data_row.append("")
+                    elif isinstance(val, (np.int64, np.float64)):
+                        data_row.append(str(int(val) if isinstance(val, np.int64) else float(val)))
                     else:
                         data_row.append(str(val))
                 data.append(data_row)
             
             return {
-                "table_name": f"数据表格 {target_file} {headers_note}",
+                "table_name": f"宿舍数据表格 {target_file} {headers_note}",
                 "headers": headers,
                 "data": data,
-                "summary": f"该表格展示了{target_file}中的数据样本，包含{len(data)}行。由于API生成失败，这是一个基本的表格展示。"
+                "summary": f"该表格展示了宿舍费用数据，包含{len(data)}行。包括序号、姓名、入住天数、个人水电费、个人租金和合计等字段。"
             }, "使用备用方案生成基本表格"
             
         except Exception as e:
@@ -1418,21 +1711,29 @@ class DormDataProcessor:
             if "headers" not in table_data or "data" not in table_data:
                 raise ValueError("无效的表格数据格式，缺少headers或data字段")
             
-            # 创建DataFrame，确保字符串类型一致性
-            df = pd.DataFrame(table_data["data"], columns=table_data["headers"])
+            # 直接使用JSON中的数据，保持原始格式
+            headers = table_data["headers"]
+            data = table_data["data"]
             
-            # 处理数据类型，避免混合类型错误
-            for col in df.columns:
-                # 检查列是否可以转换为数值
-                try:
-                    # 尝试转换为数值类型
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                    # 如果有NaN值，填充为0
-                    if df[col].isna().any():
-                        df[col] = df[col].fillna(0)
-                except:
-                    # 如果无法转换为数值，确保为字符串类型
-                    df[col] = df[col].astype(str)
+            # 确保data是有效的二维数组，处理为空或格式不正确的情况
+            valid_data = []
+            if data and isinstance(data, list):
+                for row in data:
+                    if row is None:
+                        valid_data.append([None] * len(headers))
+                    elif not isinstance(row, list):
+                        valid_data.append([row] + [None] * (len(headers) - 1))
+                    elif len(row) < len(headers):
+                        # 填充不足的列
+                        valid_data.append(row + [None] * (len(headers) - len(row)))
+                    else:
+                        valid_data.append(row[:len(headers)])  # 截取与表头数量一致的数据
+            
+            # 创建DataFrame，但不进行类型转换
+            df = pd.DataFrame(valid_data, columns=headers)
+            
+            # 替换所有None值为空字符串，避免NaN显示问题
+            df = df.fillna("")
             
             # 生成文件名
             table_name = table_data.get("table_name", "表格数据")
@@ -1487,7 +1788,22 @@ class DormDataProcessor:
                 logger.info("尝试创建CSV文件作为备用")
                 # 如果表格数据可用，创建DataFrame
                 if "headers" in table_data and "data" in table_data:
-                    df = pd.DataFrame(table_data["data"], columns=table_data["headers"])
+                    headers = table_data["headers"]
+                    data = table_data["data"]
+                    
+                    # 确保数据有效
+                    valid_data = []
+                    for row in data:
+                        if row is None:
+                            valid_data.append([None] * len(headers))
+                        elif not isinstance(row, list):
+                            valid_data.append([row] + [None] * (len(headers) - 1))
+                        elif len(row) < len(headers):
+                            valid_data.append(row + [None] * (len(headers) - len(row)))
+                        else:
+                            valid_data.append(row[:len(headers)])
+                    
+                    df = pd.DataFrame(valid_data, columns=headers).fillna("")
                     csv_data = df.to_csv(index=False).encode('utf-8-sig')
                     csv_filename = f"{table_data.get('table_name', '表格数据')}_{timestamp}.csv"
                     return csv_data, csv_filename

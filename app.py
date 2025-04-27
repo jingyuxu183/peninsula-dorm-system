@@ -664,7 +664,7 @@ if st.session_state.original_df is not None:
                                     # 确保所有单元格内容为字符串并限制长度
                                     row_data = []
                                     for cell in data_rows[i]:
-                                        cell_str = str(cell)
+                                        cell_str = str(cell) if cell is not None else ""
                                         # 如果单元格内容太长，截断它
                                         if len(cell_str) > 20:
                                             cell_str = cell_str[:17] + "..."
@@ -674,7 +674,14 @@ if st.session_state.original_df is not None:
                                 
                                 preview_text += f"\n{table_md}\n\n"
                             else:
-                                preview_text += "\n\n*表格数据为空或格式不正确*\n\n"
+                                if headers:
+                                    # 如果有表头但没有数据行，显示空表格
+                                    table_md = "| " + " | ".join(headers) + " |\n"
+                                    table_md += "| " + " | ".join(["---" for _ in headers]) + " |\n"
+                                    table_md += "| " + " | ".join(["" for _ in headers]) + " |\n"
+                                    preview_text += f"\n{table_md}\n\n*表格暂无数据*\n\n"
+                                else:
+                                    preview_text += "\n\n*表格数据为空或格式不正确*\n\n"
 
                             # 添加表格统计信息
                             preview_text += f"""**表格统计信息**：
@@ -768,22 +775,49 @@ if st.session_state.original_df is not None:
                 except Exception as excel_error:
                     st.error(f"Excel生成失败: {str(excel_error)}，将提供CSV下载选项")
                     
-                    # 创建一个基本的CSV备选方案
-                    if "headers" in st.session_state.table_json and "data" in st.session_state.table_json:
-                        df = pd.DataFrame(
-                            st.session_state.table_json["data"], 
-                            columns=st.session_state.table_json["headers"]
-                        )
-                        csv_data = df.to_csv(index=False).encode('utf-8-sig')
-                        table_name = st.session_state.table_json.get('table_name', '数据表格')
-                        timestamp = int(time.time())
+                # 创建一个基本的CSV备选方案
+                if "headers" in st.session_state.table_json and "data" in st.session_state.table_json:
+                    # 确保data是有效的二维数组
+                    data = st.session_state.table_json["data"]
+                    headers = st.session_state.table_json["headers"]
+                    
+                    # 处理data为空的情况
+                    if not data or len(data) == 0:
+                        # 创建一个只有表头的空DataFrame
+                        df = pd.DataFrame(columns=headers)
+                    else:
+                        # 检查每行是否有足够的列
+                        clean_data = []
+                        for row in data:
+                            # 如果行数据是None，创建空行
+                            if row is None:
+                                clean_data.append([None] * len(headers))
+                            # 处理空列表的情况
+                            elif len(row) == 0:
+                                clean_data.append([None] * len(headers))
+                            # 确保行长度与表头匹配
+                            elif len(row) < len(headers):
+                                # 填充缺少的单元格为None
+                                padded_row = row + [None] * (len(headers) - len(row))
+                                clean_data.append(padded_row)
+                            else:
+                                clean_data.append(row)
+                                
+                        df = pd.DataFrame(clean_data, columns=headers)
                         
-                        st.download_button(
-                            label=f"下载{table_name} (CSV格式)",
-                            data=csv_data,
-                            file_name=f"{table_name}_{timestamp}.csv",
-                            mime="text/csv"
-                        )
+                    # 处理数据中的None值
+                    df = df.fillna("")
+                    
+                    csv_data = df.to_csv(index=False).encode('utf-8-sig')
+                    table_name = st.session_state.table_json.get('table_name', '数据表格')
+                    timestamp = int(time.time())
+                    
+                    st.download_button(
+                        label=f"下载{table_name} (CSV格式)",
+                        data=csv_data,
+                        file_name=f"{table_name}_{timestamp}.csv",
+                        mime="text/csv"
+                    )
                 
                 # 添加查看详情的展开部分
                 with st.expander("查看表格详细数据"):
@@ -791,11 +825,44 @@ if st.session_state.original_df is not None:
                     
                     # 如果有相当数量的数据，还可以显示为DataFrame
                     if "headers" in st.session_state.table_json and "data" in st.session_state.table_json:
-                        df = pd.DataFrame(
-                            st.session_state.table_json["data"], 
-                            columns=st.session_state.table_json["headers"]
-                        )
-                        st.dataframe(df, use_container_width=True)
+                        # 确保data是有效的二维数组
+                        data = st.session_state.table_json["data"]
+                        headers = st.session_state.table_json["headers"]
+                        
+                        try:
+                            # 处理data为空的情况
+                            if not data or len(data) == 0:
+                                # 创建一个只有表头的空DataFrame
+                                df = pd.DataFrame(columns=headers)
+                                st.info("表格数据为空")
+                            else:
+                                # 检查每行是否有足够的列
+                                clean_data = []
+                                for row in data:
+                                    # 如果行数据是None，创建空行
+                                    if row is None:
+                                        clean_data.append([None] * len(headers))
+                                    # 处理空列表的情况
+                                    elif len(row) == 0:
+                                        clean_data.append([None] * len(headers))
+                                    # 确保行长度与表头匹配
+                                    elif len(row) < len(headers):
+                                        # 填充缺少的单元格为None
+                                        padded_row = row + [None] * (len(headers) - len(row))
+                                        clean_data.append(padded_row)
+                                    else:
+                                        clean_data.append(row)
+                                        
+                                df = pd.DataFrame(clean_data, columns=headers)
+                            
+                            # 处理数据中的None值
+                            df = df.fillna("")
+                            
+                            st.dataframe(df, use_container_width=True)
+                        except Exception as df_error:
+                            st.error(f"显示表格数据时出错: {str(df_error)}")
+                            st.write("原始数据:")
+                            st.write(st.session_state.table_json)
             except Exception as e:
                 st.error(f"准备表格下载时出错: {str(e)}")
                 # 最后的备选方案 - 直接显示数据
