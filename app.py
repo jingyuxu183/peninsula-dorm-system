@@ -536,28 +536,68 @@ if st.session_state.original_df is not None:
             
             # 检查是否是表格生成请求
             is_table_request = False
-            table_keywords = ["表格", "生成表", "创建表", "制作表", "汇总表", "导出表", "统计表", "分析表", 
-                             "表单", "电子表格", "excel", "转为表格", "做个表", "做一个表", "数据表", "列表"]
-
-            # 检查用户输入是否包含表格相关关键词
-            for keyword in table_keywords:
-                if keyword in user_input.lower():
-                    is_table_request = True
-                    break
-
-            # 更智能的分析：检查是否是表格生成意图
-            if not is_table_request:
-                # 检查是否包含汇总、导出、整理等与表格相关的动作词
-                action_keywords = ["汇总", "导出", "整理", "归纳", "分组", "分类", "统计", "计算总和", 
-                                  "计算平均", "排序", "筛选", "结构化", "可视化"]
-                data_keywords = ["数据", "信息", "记录", "费用", "金额", "人员", "宿舍", "楼号", "房间"]
-                
-                action_match = any(keyword in user_input for keyword in action_keywords)
-                data_match = any(keyword in user_input for keyword in data_keywords)
-                
-                # 如果同时匹配动作词和数据词，很可能是表格请求
-                if action_match and data_match:
-                    is_table_request = True
+            
+            # 首先进行初步筛选，以减少不必要的API调用
+            # 明确的表格生成关键词
+            explicit_table_keywords = ["生成表格", "创建表格", "制作表格", "做个表格", "导出表格"]
+            
+            # 明确不是表格生成的关键词
+            explicit_non_table_keywords = ["分析表格数据", "查看表格内容", "解读表格", "表格是什么"]
+            
+            # 如果包含明确的表格生成关键词，直接判定为表格请求
+            if any(keyword in user_input.lower() for keyword in explicit_table_keywords):
+                is_table_request = True
+            # 如果包含明确不是表格生成的关键词，直接判定为非表格请求
+            elif any(keyword in user_input.lower() for keyword in explicit_non_table_keywords):
+                is_table_request = False
+            # 对于模糊情况，使用DeepSeek API判断
+            else:
+                try:
+                    # 准备一个简单的系统提示
+                    intent_system_prompt = """你是一个专门判断用户意图的助手。
+                    请判断用户是想要生成一个数据表格，还是想进行数据分析或询问其他问题。
+                    
+                    如果用户明确想要生成表格或导出数据为表格形式，回答"生成表格"。
+                    如果用户是想分析数据、查询信息或提问，回答"非表格生成"。
+                    
+                    只回答"生成表格"或"非表格生成"，不要有任何其他解释。"""
+                    
+                    # 准备用户消息
+                    intent_user_prompt = f"请判断以下用户输入是要生成表格还是分析数据：\n\n用户输入: {user_input}"
+                    
+                    # 调用DeepSeek API判断意图
+                    intent_messages = [
+                        {"role": "system", "content": intent_system_prompt},
+                        {"role": "user", "content": intent_user_prompt}
+                    ]
+                    
+                    # 使用低温度以获得更确定的回答
+                    intent_response, _ = processor.api.generate_response(
+                        messages=intent_messages, 
+                        model="deepseek-chat"
+                    )
+                    
+                    # 分析回答
+                    intent_response = intent_response.strip().lower()
+                    is_table_request = "生成表格" in intent_response
+                    
+                    # 记录判断结果
+                    logger.info(f"DeepSeek API 意图判断：用户输入 '{user_input}' -> 结果: '{intent_response}' -> 判定为{'表格生成请求' if is_table_request else '非表格生成请求'}")
+                    
+                except Exception as e:
+                    # 如果API调用失败，回退到原有的基于规则的判断
+                    logger.error(f"使用DeepSeek API判断意图时出错: {str(e)}，回退到基于规则的判断")
+                    
+                    # 回退到简化版的规则判断
+                    action_keywords = ["汇总", "导出", "整理", "创建", "生成", "做一个"]
+                    analysis_keywords = ["分析", "查看", "解读", "计算", "告诉我"]
+                    
+                    # 如果有明确的动作词但没有分析词，判定为表格请求
+                    action_match = any(keyword in user_input.lower() for keyword in action_keywords)
+                    analysis_match = any(keyword in user_input.lower() for keyword in analysis_keywords)
+                    
+                    if action_match and not analysis_match and "表格" in user_input.lower():
+                        is_table_request = True
             
             # 构建消息历史用于API请求
             messages = [

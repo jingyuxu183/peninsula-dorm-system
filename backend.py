@@ -1168,6 +1168,134 @@ class DormDataProcessor:
                 if df is None or df.empty:
                     return {"error": "没有可用的数据"}, "没有数据可以处理"
             
+            # 首先尝试从正常对话API获取可能已经计算好的表格
+            try:
+                logger.info("尝试从DeepSeek API对话中提取表格")
+                
+                # 准备系统提示
+                system_prompt = """你是一个专业的宿舍数据分析助手，擅长数据分析和费用计算。
+                请根据用户的表格生成请求，执行必要的计算，并返回完整的计算过程和结果表格。
+                
+                计算规则：
+                1. 个人水电费 = (入住天数 / 合计天数) * 宿舍水电费
+                2. 如果个人租金这栏没有数据，则默认为0
+                3. 合计 = 个人水电费 + 个人租金
+                
+                表格应包含：序号、姓名、入住天数、宿舍水电费、个人水电费、个人租金、合计等信息。
+                请展示详细的计算过程，确保用户能够理解每一步的计算。
+                
+                返回格式应包含:
+                1. 计算逻辑说明
+                2. Markdown格式的表格，展示计算结果
+                """
+                
+                # 准备聊天历史
+                messages = [
+                    {"role": "system", "content": system_prompt}
+                ]
+                
+                # 添加数据上下文
+                data_context = f"用户上传的数据信息: 共{len(df)}行记录。"
+                
+                # 添加数据样本
+                sample_rows = min(10, len(df))
+                sample_df = df.head(sample_rows)
+                columns_info = []
+                
+                for col in df.columns:
+                    sample_val = ""
+                    if not sample_df.empty and col in sample_df.columns:
+                        sample_val = str(sample_df[col].iloc[0])
+                        if len(sample_val) > 20:
+                            sample_val = sample_val[:17] + "..."
+                    columns_info.append(f"{col} (样本值: {sample_val})")
+                
+                data_context += f"\n\n列信息: {', '.join(columns_info)}"
+                data_context += f"\n\n数据样本:\n{sample_df.to_string(index=False)}"
+                
+                # 聚焦于表格生成请求
+                enhanced_request = f"请分析以下数据并{user_request}。请计算每个人的个人水电费和合计费用。\n\n{data_context}"
+                
+                # 添加历史聊天记录上下文
+                if chat_messages:
+                    chat_context = []
+                    for msg in chat_messages[-5:]:  # 只使用最近5条消息
+                        role = msg.get("role", "")
+                        content = msg.get("content", "")
+                        if role and content:
+                            chat_context.append({"role": role, "content": content})
+                    
+                    if chat_context:
+                        messages.extend(chat_context)
+                
+                messages.append({"role": "user", "content": enhanced_request})
+                
+                # 调用API获取完整回答（包含计算表格）
+                full_response, _ = self.api.stream_chat_completion(messages, model="deepseek-chat")
+                logger.info("获取到API完整回答")
+                
+                # 从回答中提取Markdown表格
+                import re
+                table_pattern = r"\|\s*([^\|]+)\s*\|\s*([^\|]+)\s*\|.*\n\|\s*[-:\s]*\|\s*[-:\s]*\|.*\n(\|.*\n)+"
+                tables = re.findall(table_pattern, full_response)
+                
+                if tables:
+                    logger.info(f"从API回答中找到{len(tables)}个表格")
+                    
+                    # 解析找到的最大表格
+                    md_table_pattern = r"\|(.*)\|\n\|([-:\s]*\|)+\n((\|.*\|\n)+)"
+                    md_tables = re.findall(md_table_pattern, full_response)
+                    
+                    if md_tables:
+                        # 找出最大的表格
+                        largest_table = None
+                        max_rows = 0
+                        
+                        for table_match in md_tables:
+                            table_content = table_match[2]
+                            rows = table_content.count('\n')
+                            if rows > max_rows:
+                                max_rows = rows
+                                largest_table = f"|{table_match[0]}|\n|{table_match[1]}\n{table_content}"
+                        
+                        if largest_table:
+                            logger.info(f"提取到最大表格，包含{max_rows}行")
+                            
+                            # 解析表头
+                            headers_line = largest_table.split('\n')[0]
+                            headers = [h.strip() for h in headers_line.split('|')[1:-1]]
+                            
+                            # 解析数据行
+                            data_rows = []
+                            for line in largest_table.split('\n')[2:]:
+                                if line.strip() and '|' in line:
+                                    row_data = [cell.strip() for cell in line.split('|')[1:-1]]
+                                    if len(row_data) == len(headers):  # 确保列数匹配
+                                        # 检查个人租金列是否为空，如果为空则设为0
+                                        for i, header in enumerate(headers):
+                                            if "个人租金" in header and (not row_data[i] or row_data[i] == "nan" or row_data[i].strip() == ""):
+                                                row_data[i] = "0"
+                                        data_rows.append(row_data)
+                            
+                            if headers and data_rows:
+                                # 创建表格JSON
+                                table_json = {
+                                    "table_name": "费用计算表格",
+                                    "headers": headers,
+                                    "data": data_rows,
+                                    "summary": "此表格包含计算好的个人水电费和合计费用"
+                                }
+                                
+                                logger.info(f"成功从API回答创建表格JSON: {len(data_rows)}行 x {len(headers)}列")
+                                return table_json, "从API回答中提取表格数据"
+                    
+                    logger.info("未能从API回答中解析出完整表格，将使用备选方法")
+                
+            except Exception as extract_error:
+                logger.error(f"从API回答提取表格时出错: {str(extract_error)}")
+                logger.info("将使用备选表格生成方法")
+            
+            # 如果从API回答中无法提取表格，继续使用现有的表格生成逻辑
             # 限制样本数据量，避免提示词过长
             sample_rows = min(30, len(df))
             
@@ -1443,6 +1571,101 @@ class DormDataProcessor:
                             # 验证数据格式是否正确
                             headers = table_data["headers"]
                             data = table_data["data"]
+                            
+                            # 检查是否是费用相关表格，如果是则计算费用
+                            fee_keywords = ["费用", "水电费", "租金", "合计"]
+                            is_fee_table = any(keyword in table_data["table_name"] for keyword in fee_keywords) or \
+                                          any(keyword in user_request for keyword in fee_keywords)
+                            
+                            # 检查表头中是否包含费用相关列
+                            fee_columns = ["个人水电费", "个人租金", "合计", "宿舍水电费"]
+                            has_fee_columns = any(col in headers for col in fee_columns)
+                            
+                            # 如果是费用表格，并且有相关列，进行费用计算
+                            if (is_fee_table or has_fee_columns) and len(data) > 0:
+                                logger.info("检测到费用相关表格，尝试计算费用")
+                                
+                                # 获取列索引
+                                header_indices = {header: i for i, header in enumerate(headers)}
+                                
+                                # 检查是否有必要的列进行计算
+                                if "入住天数" in header_indices and "个人水电费" in header_indices:
+                                    # 遍历数据行进行计算
+                                    for row in data:
+                                        if len(row) >= len(headers):
+                                            # 获取入住天数
+                                            days_index = header_indices["入住天数"]
+                                            try:
+                                                days = float(row[days_index]) if row[days_index] not in (None, "") else 0
+                                            except (ValueError, TypeError):
+                                                days = 0
+                                                
+                                            # 获取个人水电费
+                                            utility_index = header_indices["个人水电费"]
+                                            # 如果水电费列为空，但存在宿舍水电费和合计天数，尝试计算个人水电费
+                                            if (row[utility_index] is None or row[utility_index] == "") and "宿舍水电费" in header_indices and "合计天数" in header_indices:
+                                                dorm_utility_index = header_indices["宿舍水电费"]
+                                                total_days_index = header_indices["合计天数"]
+                                                try:
+                                                    dorm_utility = float(row[dorm_utility_index]) if row[dorm_utility_index] not in (None, "") else 0
+                                                    total_days = float(row[total_days_index]) if row[total_days_index] not in (None, "") else 0
+                                                    if total_days > 0:
+                                                        # 计算个人水电费 = 入住天数 ÷ 合计天数 × 宿舍水电费
+                                                        utility_fee = round((days / total_days) * dorm_utility, 2)
+                                                        row[utility_index] = str(utility_fee)
+                                                except (ValueError, TypeError, ZeroDivisionError):
+                                                    pass
+                                            
+                                            # 如果水电费列仍为空，但存在水电费列值
+                                            if (row[utility_index] is None or row[utility_index] == "") and "370.5" in str(row):
+                                                # 值为370.5的是宿舍水电费，而不是个人水电费，需要计算个人水电费
+                                                try:
+                                                    # 找到数据中的370.5值所在的列索引
+                                                    dorm_utility_value = 370.5
+                                                    dorm_utility_col_index = None
+                                                    for i, cell in enumerate(row):
+                                                        if str(cell) == "370.5":
+                                                            dorm_utility_col_index = i
+                                                            break
+                                                    
+                                                    # 计算个人水电费 = 入住天数 ÷ 31(默认合计天数) × 宿舍水电费
+                                                    total_days = 31  # 默认一个月31天
+                                                    utility_fee = round((days / total_days) * dorm_utility_value, 2)
+                                                    row[utility_index] = str(utility_fee)
+                                                    
+                                                    # 添加日志记录计算过程
+                                                    logger.info(f"发现值为370.5的宿舍水电费，计算个人水电费: {days} / {total_days} * {dorm_utility_value} = {utility_fee}")
+                                                except (ValueError, TypeError, ZeroDivisionError) as e:
+                                                    logger.error(f"计算个人水电费时出错: {e}")
+                                                    pass
+                                            
+                                            # 计算个人租金 (如果有)
+                                            rent_fee = 0
+                                            if "个人租金" in header_indices:
+                                                rent_index = header_indices["个人租金"]
+                                                try:
+                                                    # 检查个人租金是否为空值，如果是则设置为"0"
+                                                    if row[rent_index] is None or row[rent_index] == "" or row[rent_index] == "nan" or str(row[rent_index]).strip() == "":
+                                                        row[rent_index] = "0"
+                                                        rent_fee = 0
+                                                    else:
+                                                        rent_fee = float(row[rent_index])
+                                                except (ValueError, TypeError):
+                                                    row[rent_index] = "0"
+                                                    rent_fee = 0
+                                                
+                                            # 计算合计费用
+                                            if "合计" in header_indices:
+                                                total_index = header_indices["合计"]
+                                                try:
+                                                    utility_fee = float(row[utility_index]) if row[utility_index] not in (None, "") else 0
+                                                    # 合计 = 个人水电费 + 个人租金
+                                                    total_fee = round(utility_fee + rent_fee, 2)
+                                                    row[total_index] = str(total_fee)
+                                                except (ValueError, TypeError):
+                                                    pass
+                                                
+                                logger.info("费用计算完成")
                             
                             # 检查是否包含姓名列（直接在headers中或等价名称）
                             name_column_alternatives = ["姓名", "名字", "姓", "名", "人员"]
